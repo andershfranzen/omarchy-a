@@ -1,5 +1,7 @@
 """desktop/configuration/rotate-output: iio-sensor-proxy orientations to output transforms."""
 import os
+import sys
+import runpy
 from pathlib import Path
 import shutil
 import subprocess
@@ -34,7 +36,6 @@ def bash_major():
     return int(out.stdout.strip() or 0)
 
 
-@unittest.skipUnless(BASH and bash_major() >= 4, 'needs bash 4+ (fractional read -t), as on the device')
 class RotateOutput(unittest.TestCase):
     def run_script(self, events, locked=False, extra_env=None, timeout=20):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,8 +53,9 @@ class RotateOutput(unittest.TestCase):
             log = root / 'randr.log'
             env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
                    'XDG_CONFIG_HOME': str(config), 'RANDR_LOG': str(log), 'ROTATE_SETTLE': '0.1',
+                   'ROTATE_COOLDOWN': '0',
                    **(extra_env or {})}
-            subprocess.run([BASH, str(SCRIPT)], env=env, check=True, timeout=timeout)
+            subprocess.run([sys.executable, str(SCRIPT)], env=env, check=True, timeout=timeout)
             return log.read_text().splitlines() if log.exists() else []
 
     def test_held_orientations_become_transforms_of_the_panel(self):
@@ -102,6 +104,41 @@ class RotateOutput(unittest.TestCase):
         finally:
             reaper.join()
         self.assertEqual(lines, ['--output Unknown-1 --transform normal'])
+
+
+class RotationPolicy(unittest.TestCase):
+    def test_monitor_sensor_tilt_suffix_is_not_part_of_orientation(self):
+        parse = runpy.run_path(str(SCRIPT))['orientation']
+        self.assertEqual(parse('=== Has accelerometer (orientation: normal, tilt: face-up)'), 'normal')
+        self.assertEqual(parse('Accelerometer orientation changed: left-up, tilt: upright'), 'left-up')
+        self.assertEqual(parse('Accelerometer orientation changed: undefined'), 'undefined')
+        self.assertIsNone(parse('Accelerometer tilt changed: face-up'))
+
+    def policy(self):
+        return runpy.run_path(str(SCRIPT))['Orientation']()
+
+    def test_repeated_messages_do_not_restart_stability_window(self):
+        p = self.policy()
+        p.observe('left-up', 0)
+        p.observe('left-up', .3)
+        self.assertEqual(p.ready(.41), 'left-up')
+
+    def test_cooldown_stops_flip_flopping(self):
+        p = self.policy()
+        p.observe('normal', 0)
+        p.committed('normal', 1)
+        p.observe('left-up', 1.1)
+        self.assertIsNone(p.ready(1.6))
+        self.assertEqual(p.ready(1.8), 'left-up')
+
+    def test_undefined_cancels_and_unlock_uses_current_reading(self):
+        p = self.policy()
+        p.observe('left-up', 0)
+        p.observe('undefined', .5)
+        self.assertIsNone(p.ready(3))
+        p.observe('right-up', 4)
+        self.assertIsNone(p.ready(5, locked=True))
+        self.assertEqual(p.ready(6, locked=False), 'right-up')
 
 
 if __name__ == '__main__':

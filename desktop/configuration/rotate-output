@@ -1,69 +1,139 @@
-#!/bin/bash
-# Turn the native panel with the device. The orientation comes from
-# iio-sensor-proxy (the accelerometer's IIO device and its mount-matrix), as
-# for GNOME and KDE; touch follows through labwc's <touch mapToOutput>.
-# An orientation is applied once it has held for half a second, so turning
-# the device past one orientation to the next doesn't rotate twice.
-# While ~/.config/omarchy/rotation-lock exists, the orientation is held.
-# It ends with the compositor (LABWC_PID): autostart backgrounds it and
-# monitor-sensor never ends by itself, so each logout used to leave both behind.
-set -uo pipefail
-lock=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/rotation-lock
-settle=${ROTATE_SETTLE:-0.5}
+#!/usr/bin/python3
+"""Debounced iio-sensor-proxy rotation with a persistent user lock.
 
-transform() {
-  case $1 in
-    normal) echo normal ;;
-    bottom-up) echo 180 ;;
-    left-up) echo 90 ;;
-    right-up) echo 270 ;;
-    *) return 1 ;;
-  esac
-}
+Only a sustained orientation is applied. Repeated identical sensor messages do
+not reset the deadline; undefined/flat readings cancel a pending transition.
+A cooldown prevents rapid flips back. Unlock applies the latest stable reading.
+"""
+import os
+from pathlib import Path
+import selectors
+import signal
+import re
+import subprocess
+import time
 
-apply() {
-  local t output
-  [[ -e $lock ]] && return
-  t=$(transform "$1") || return
-  output=$(wlr-randr | awk '/^[^[:space:]]/ {print $1; exit}')
-  [[ -n $output ]] && wlr-randr --output "$output" --transform "$t"
-}
+TRANSFORMS = {'normal': 'normal', 'bottom-up': '180', 'left-up': '90', 'right-up': '270'}
 
-orientation() {
-  case $1 in
-    *'orientation changed: '*) echo "${1##*: }" ;;
-    *'Has accelerometer (orientation: '*) value=${1##*orientation: }; echo "${value%)}" ;;
-  esac
-}
 
-exec {sensor}< <(exec monitor-sensor --accel)
-sensor_pid=$!
-watcher=''
-if [[ -n ${LABWC_PID:-} ]]; then
-  ( while kill -0 "$LABWC_PID" 2>/dev/null; do sleep 2; done
-    kill "$sensor_pid" 2>/dev/null ) &
-  watcher=$!
-fi
+class Orientation:
+    def __init__(self, settle=0.4, cooldown=0.75):
+        self.settle = settle
+        self.cooldown = cooldown
+        self.pending = None
+        self.since = 0.0
+        self.applied = None
+        self.last_apply = float('-inf')
 
-pending='' applied=''
-while :; do
-  if [[ -n $pending ]]; then
-    IFS= read -r -t "$settle" -u "$sensor" line
-    status=$?
-    if ((status == 0)); then
-      next=$(orientation "$line") && [[ -n $next ]] && pending=$next
-      continue
-    fi
-    ((status > 128)) || break   # end of input, not a timeout
-    [[ $pending != "$applied" ]] && apply "$pending" && applied=$pending
-    pending=''
-  else
-    IFS= read -r -u "$sensor" line || break
-    next=$(orientation "$line") && [[ -n $next ]] && pending=$next
-  fi
-done
-[[ -n $watcher ]] && kill "$watcher" 2>/dev/null
-if [[ -n $pending && $pending != "$applied" ]]; then
-  apply "$pending"
-fi
-exit 0
+    def observe(self, value, now):
+        value = value if value in TRANSFORMS else None
+        if value != self.pending:
+            self.pending, self.since = value, now
+
+    def ready(self, now, locked=False):
+        if (locked or self.pending is None or self.pending == self.applied
+                or now - self.since < self.settle or now - self.last_apply < self.cooldown):
+            return None
+        return self.pending
+
+    def committed(self, value, now):
+        self.applied, self.last_apply = value, now
+
+
+def orientation(line):
+    # New monitor-sensor versions append a separate ', tilt: face-up' field.
+    # Only the orientation token belongs to the rotation state machine.
+    match = re.search(r'orientation(?: changed)?:\s*([a-z-]+)(?=[,\s)]|$)', line)
+    return match.group(1) if match else None
+
+
+def trace(message):
+    if os.environ.get('ORCHARD_ROTATION_TRACE') == '1':
+        print(f'rotation trace t={time.monotonic():.3f} {message}', flush=True)
+
+
+def apply(value):
+    started = time.monotonic()
+    trace(f'output query start orientation={value}')
+    result = subprocess.run(['wlr-randr'], capture_output=True, text=True, timeout=3, check=True)
+    # Prefer the internal panel, never arbitrarily rotate an external monitor.
+    outputs = [line.split()[0] for line in result.stdout.splitlines() if line and not line[0].isspace()]
+    output = next((name for name in outputs if name.startswith(('eDP-', 'DSI-', 'LVDS-'))),
+                  outputs[0] if len(outputs) == 1 else None)
+    if output is None:
+        return False
+    queried = time.monotonic()
+    trace(f'output query done ms={(queried - started) * 1000:.0f}; request {TRANSFORMS[value]}')
+    subprocess.run(['wlr-randr', '--output', output, '--transform', TRANSFORMS[value]],
+                   check=True, timeout=4)
+    trace(f'output request done ms={(time.monotonic() - queried) * 1000:.0f}')
+    print(f'rotation applied: {output} {value} -> {TRANSFORMS[value]}', flush=True)
+    return True
+
+
+def main():
+    lock = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'omarchy/rotation-lock'
+    state = Orientation(float(os.environ.get('ROTATE_SETTLE', '.4')),
+                        float(os.environ.get('ROTATE_COOLDOWN', '.75')))
+    parent = int(os.environ.get('LABWC_PID', '0'))
+    monitor = subprocess.Popen(['monitor-sensor', '--accel'], stdout=subprocess.PIPE)
+    os.set_blocking(monitor.stdout.fileno(), False)
+    selector = selectors.DefaultSelector()
+    selector.register(monitor.stdout, selectors.EVENT_READ)
+    running = True
+    def stop(*_):
+        nonlocal running
+        running = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    buffered = b''
+    eof = False
+    try:
+        while running:
+            if parent:
+                try:
+                    os.kill(parent, 0)
+                except ProcessLookupError:
+                    break
+            for key, _ in selector.select(.1):
+                data = os.read(key.fd, 8192)
+                if not data:
+                    eof = True
+                    selector.unregister(key.fd)
+                    continue
+                buffered += data
+                while b'\n' in buffered:
+                    line, buffered = buffered.split(b'\n', 1)
+                    value = orientation(line.decode(errors='replace'))
+                    if value is not None:
+                        trace(f'sensor orientation={value}')
+                        state.observe(value, time.monotonic())
+            now = time.monotonic()
+            value = state.ready(now, lock.exists())
+            if value is not None:
+                trace(f'stable orientation={value} waited_ms={(now - state.since) * 1000:.0f}')
+                try:
+                    if apply(value):
+                        state.committed(value, now)
+                except (OSError, subprocess.SubprocessError) as error:
+                    print(f'rotation failed: {error}', flush=True)
+                    state.last_apply = now  # bounded retry; never mark failure applied
+            if eof:
+                # No accelerated apply on EOF: wait out any pending stability window.
+                if lock.exists() or state.pending is None or state.pending == state.applied:
+                    break
+                if now - state.since > state.settle + state.cooldown + 5:
+                    break
+    finally:
+        selector.close()
+        monitor.terminate()
+        try:
+            monitor.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            monitor.kill()
+            monitor.wait()
+        monitor.stdout.close()
+
+
+if __name__ == '__main__':
+    main()

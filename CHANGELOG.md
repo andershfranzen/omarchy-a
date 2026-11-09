@@ -20,6 +20,19 @@ work, with an on-screen display.
 
 ### Desktop
 
+- A more familiar five-row on-screen keyboard, with staggered letters, visible
+  punctuation, larger editing icons, an Omarchy Super key, and double-tap Shift
+  for Caps Lock. Key presses highlight immediately without breaking swipe-down
+  dismissal.
+- Swipe up from the bottom edge to open the keyboard. Every opening slides in
+  from below; the status-bar button and normal hide requests slide it out too.
+- Idle screen-off gives an eight-second grace period before locking, so a quick
+  wake returns to the desktop without a PIN. Explicit locking still takes
+  effect immediately. Screen-off and wake use eased brightness transitions.
+- Rotation lock in the Display menu, with orientation stability filtering
+  and a cooldown to prevent rapid portrait/landscape flips.
+- Stop unnecessary bar and wallpaper remapping on rotation: geometry-change
+  notifications at an unchanged screen position no longer hide those layers.
 - Fix the System menu’s Shutdown and Reboot actions.
 - Automatic rotation on the iPad 6 through iio-sensor-proxy, using orchard's
   in-kernel accelerometer driver; rotation waits for the device to settle, and

@@ -1,0 +1,248 @@
+--- a/include/output.h
++++ b/include/output.h
+@@ -28,0 +29,7 @@
++	struct wl_listener rotation_commit;
++	struct wlr_buffer *rotation_last_frame;
++	struct wlr_scene_buffer *rotation_cover;
++	double rotation_started, rotation_fade_started;
++	int rotation_ready_frames;
++	struct rotation_waiter *rotation_waiters;
++	double rotation_ready_since;
+--- a/src/output.c
++++ b/src/output.c
+@@ -17,0 +18,4 @@
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_layer_shell_v1.h>
++#include <wlr/util/transform.h>
+@@ -250,0 +255,213 @@
++struct rotation_waiter {
++	char *namespace;
++	uint32_t layer, anchor, sequence;
++	int width, height;
++	struct wlr_surface *old_surface; /* cleared by its destroy listener */
++	struct wl_listener destroy;
++	struct rotation_waiter *next;
++};
++
++static void
++rotation_surface_destroy(struct wl_listener *listener, void *data)
++{
++	struct rotation_waiter *waiter = wl_container_of(listener, waiter, destroy);
++	waiter->old_surface = NULL;
++	wl_list_remove(&waiter->destroy.link);
++	wl_list_init(&waiter->destroy.link);
++}
++
++static double
++rotation_now(void)
++{
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return now.tv_sec + now.tv_nsec / 1000000000.0;
++}
++
++static void
++rotation_clear(struct output *output)
++{
++	if (output->rotation_cover) {
++		wlr_scene_node_destroy(&output->rotation_cover->node);
++		output->rotation_cover = NULL;
++	}
++	output->rotation_ready_frames = 0;
++	output->rotation_fade_started = 0;
++	output->rotation_ready_since = 0;
++	while (output->rotation_waiters) {
++		struct rotation_waiter *waiter = output->rotation_waiters;
++		output->rotation_waiters = waiter->next;
++		wl_list_remove(&waiter->destroy.link);
++		free(waiter->namespace);
++		free(waiter);
++	}
++}
++
++static void
++handle_rotation_commit(struct wl_listener *listener, void *data)
++{
++	struct output *output = wl_container_of(listener, output, rotation_commit);
++	struct wlr_output_event_commit *event = data;
++	if (server.session_lock_manager && server.session_lock_manager->locked) {
++		rotation_clear(output);
++		if (output->rotation_last_frame) {
++			wlr_buffer_unlock(output->rotation_last_frame);
++			output->rotation_last_frame = NULL;
++		}
++		return;
++	}
++	if ((event->state->committed & WLR_OUTPUT_STATE_BUFFER) && event->state->buffer) {
++		struct wlr_buffer *frame = wlr_buffer_lock(event->state->buffer);
++		if (output->rotation_last_frame) {
++			wlr_buffer_unlock(output->rotation_last_frame);
++		}
++		output->rotation_last_frame = frame;
++	}
++}
++
++static bool
++rotation_accepts_input(struct wlr_scene_buffer *buffer, double *x, double *y)
++{
++	return false;
++}
++
++static bool
++rotation_persistent_layer(struct wlr_layer_surface_v1 *layer)
++{
++	/* Popovers/dismiss shields have no stable size or lifetime across a
++	 * rotation. They must not turn a visual transition into a timeout. */
++	return layer->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND
++		|| layer->current.exclusive_zone > 0;
++}
++
++static void
++rotation_begin(struct output *output)
++{
++	rotation_clear(output);
++	if (!output->rotation_last_frame || !output->wlr_output->enabled
++			|| (server.session_lock_manager && server.session_lock_manager->locked)) {
++		return;
++	}
++	struct wlr_scene_buffer *cover = wlr_scene_buffer_create(&server.scene->tree,
++		output->rotation_last_frame);
++	if (!cover) {
++		return;
++	}
++	output->rotation_cover = cover;
++	output->rotation_started = rotation_now();
++	/* Remember visible shell roles before the reconfigure. An empty layer
++	 * list during a shell rebuild is NOT evidence that the new frame is ready. */
++	for (size_t i = 0; i < ARRAY_SIZE(output->layer_tree); ++i) {
++		struct wlr_scene_node *node;
++		wl_list_for_each(node, &output->layer_tree[i]->children, link) {
++			struct lab_layer_surface *layer = node_layer_surface_from_node(node);
++			struct wlr_layer_surface_v1 *ls = layer->layer_surface;
++			if (!layer->mapped || !rotation_persistent_layer(ls)) {
++				continue;
++			}
++			struct rotation_waiter *waiter = znew(*waiter);
++			waiter->namespace = strdup(ls->namespace ? ls->namespace : "");
++			waiter->layer = ls->current.layer;
++			waiter->anchor = ls->current.anchor;
++			waiter->old_surface = ls->surface;
++			waiter->destroy.notify = rotation_surface_destroy;
++			wl_signal_add(&ls->surface->events.destroy, &waiter->destroy);
++			waiter->sequence = ls->surface->current.seq;
++			waiter->width = ls->surface->current.width;
++			waiter->height = ls->surface->current.height;
++			waiter->next = output->rotation_waiters;
++			output->rotation_waiters = waiter;
++		}
++	}
++	cover->point_accepts_input = rotation_accepts_input;
++	/* Never cover the security layer or intercept input. An almost-opaque
++	 * cover keeps underlying clients visible to frame-done/readiness logic. */
++	wlr_scene_node_place_below(&cover->node, &output->session_lock_tree->node);
++	wlr_scene_buffer_set_opacity(cover, 0.999f);
++}
++
++static void
++rotation_tick(struct output *output)
++{
++	struct wlr_scene_buffer *cover = output->rotation_cover;
++	if (!cover) {
++		return;
++	}
++	if (server.session_lock_manager && server.session_lock_manager->locked) {
++		rotation_clear(output);
++		return;
++	}
++	struct wlr_box box;
++	wlr_output_layout_get_box(server.output_layout, output->wlr_output, &box);
++	wlr_scene_node_set_position(&cover->node, box.x, box.y);
++	wlr_scene_buffer_set_dest_size(cover, box.width, box.height);
++	/* Scene buffers invert this transform when rendering. Using the inverse
++	 * here applies the output rotation twice and flips the frozen frame. */
++	wlr_scene_buffer_set_transform(cover, output->wlr_output->transform);
++	bool ready = true;
++	struct view *view;
++	wl_list_for_each(view, &server.views, link) {
++		if (view->mapped && view->output == output && view->pending_configure_serial) {
++			ready = false;
++		}
++	}
++	for (size_t i = 0; i < ARRAY_SIZE(output->layer_tree); ++i) {
++		struct wlr_scene_node *node;
++		wl_list_for_each(node, &output->layer_tree[i]->children, link) {
++			struct lab_layer_surface *layer = node_layer_surface_from_node(node);
++			if (layer->mapped && rotation_persistent_layer(layer->layer_surface)
++					&& !wl_list_empty(&layer->layer_surface->configure_list)) {
++				ready = false;
++			}
++		}
++	}
++	for (struct rotation_waiter *waiter = output->rotation_waiters; waiter; waiter = waiter->next) {
++		bool repainted = false;
++		for (size_t i = 0; i < ARRAY_SIZE(output->layer_tree); ++i) {
++			struct wlr_scene_node *node;
++			wl_list_for_each(node, &output->layer_tree[i]->children, link) {
++				struct lab_layer_surface *layer = node_layer_surface_from_node(node);
++				struct wlr_layer_surface_v1 *ls = layer->layer_surface;
++				if (layer->mapped && ls->surface->buffer
++						&& ls->current.layer == waiter->layer && ls->current.anchor == waiter->anchor
++						&& !strcmp(ls->namespace ? ls->namespace : "", waiter->namespace)
++						&& (ls->surface != waiter->old_surface || ls->surface->current.seq != waiter->sequence
++							|| (ls->surface->current.width == waiter->width && ls->surface->current.height == waiter->height
++								&& (int)ls->current.actual_width == waiter->width && (int)ls->current.actual_height == waiter->height))
++						&& wl_list_empty(&ls->configure_list)
++						&& ls->surface->current.width == (int)ls->current.actual_width
++						&& ls->surface->current.height == (int)ls->current.actual_height) {
++					repainted = true;
++				}
++			}
++		}
++		ready &= repainted;
++	}
++	double now = rotation_now();
++	if (!output->rotation_fade_started) {
++		output->rotation_ready_frames = ready ? output->rotation_ready_frames + 1 : 0;
++		if (!ready) {
++			output->rotation_ready_since = 0;
++		} else if (!output->rotation_ready_since) {
++			output->rotation_ready_since = now;
++		}
++		/* Repainted shell roles must remain ready for a short quiet interval. */
++		if ((output->rotation_ready_frames >= 2 && output->rotation_ready_since
++				&& now - output->rotation_ready_since >= 0.05)
++				|| now - output->rotation_started >= 2.5) {
++			wlr_log(WLR_INFO, "rotation transition: %s after %.0f ms",
++				ready ? "ready" : "timeout", (now - output->rotation_started) * 1000);
++			output->rotation_fade_started = now;
++		}
++	} else {
++		double t = (now - output->rotation_fade_started) / 0.22;
++		if (t >= 1) {
++			rotation_clear(output);
++			return;
++		}
++		double ease = t * t * (3 - 2 * t);
++		wlr_scene_buffer_set_opacity(cover, (float)(0.999 * (1 - ease)));
++	}
++	wlr_output_schedule_frame(output->wlr_output);
++}
++
+@@ -275,0 +493 @@
++	rotation_tick(output);
+@@ -312,0 +531,5 @@
++	wl_list_remove(&output->rotation_commit.link);
++	rotation_clear(output);
++	if (output->rotation_last_frame) {
++		wlr_buffer_unlock(output->rotation_last_frame);
++	}
+@@ -710,0 +934,2 @@
++	output->rotation_commit.notify = handle_rotation_commit;
++	wl_signal_add(&wlr_output->events.commit, &output->rotation_commit);
+@@ -856,0 +1082,3 @@
++			if (o->transform != head->state.transform) {
++				rotation_begin(output);
++			}
+@@ -862,0 +1091 @@
++			rotation_clear(output);

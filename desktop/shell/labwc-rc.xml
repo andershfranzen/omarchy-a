@@ -116,7 +116,9 @@
       <action name="Execute" command="omarchy-toggle-bar" />
     </keybind>
   </keyboard>
-  <touch mouseEmulation="no" />
+  <touch mouseEmulation="no"
+    bottomSwipeCommand="/home/tablet/.local/share/omarchy-ipad/bin/omarchy-keyboard show"
+    bottomSwipeIgnoreNamespace="wvkbd" />
   <snapping>
     <!-- Keep titlebar double-click maximize; top-edge dragging tiles upward. -->
     <topMaximize>no</topMaximize>
